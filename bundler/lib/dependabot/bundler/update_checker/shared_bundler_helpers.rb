@@ -227,9 +227,6 @@ module Dependabot
           end
         end
 
-        sig { abstract.returns(String) }
-        def bundler_version; end
-
         def write_temporary_dependency_files
           dependency_files.each do |file|
             path = file.name
@@ -254,6 +251,11 @@ module Dependabot
           dependency_files.find { |f| f.name == "Gemfile.lock" } ||
             dependency_files.find { |f| f.name == "gems.locked" }
         end
+
+        private
+
+        sig { abstract.returns(String) }
+        def bundler_version; end
       end
     end
   end
