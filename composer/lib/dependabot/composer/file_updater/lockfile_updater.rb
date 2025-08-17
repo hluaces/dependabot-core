@@ -401,8 +401,8 @@ module Dependabot
 
               content =
                 JSON.pretty_generate(updated_object, indent: "    ")
-                  .gsub(/\[\n\n\s*\]/, "[]")
-                  .gsub(/\}\z/, "}\n")
+                    .gsub(/\[\n\n\s*\]/, "[]")
+                    .gsub(/\}\z/, "}\n")
             end
           end
           content
