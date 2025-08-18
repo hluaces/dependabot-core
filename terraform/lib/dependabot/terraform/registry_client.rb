@@ -6,6 +6,7 @@ require "dependabot/errors"
 require "dependabot/registry_client"
 require "dependabot/source"
 require "dependabot/terraform/version"
+require "dependabot/terraform/private_registry_logger"
 
 module Dependabot
   module Terraform
@@ -114,28 +115,63 @@ module Dependabot
       sig { params(dependency: Dependabot::Dependency).returns(T.nilable(Dependabot::Source)) }
       def source(dependency:)
         type = T.must(dependency.requirements.first)[:source][:type]
+
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "source_resolution",
+          details: {
+            dependency_name: dependency.name,
+            dependency_version: dependency.version,
+            source_type: type
+          }
+        )
+
         base_url = service_url_for(service_key_for(type))
+        source_url = nil
+
         case type
         # https://www.terraform.io/internals/module-registry-protocol#download-source-code-for-a-specific-module-version
         when "module", "modules", "registry"
-          download_url = URI.join(base_url, "#{dependency.name}/#{dependency.version}/download")
-          response = http_get(download_url)
-          return nil unless response.status == 204
-
-          source_url = response.headers.fetch("X-Terraform-Get")
-          source_url = URI.join(download_url, source_url) if
-            source_url.start_with?("/", "./", "../")
-          source_url = RegistryClient.get_proxied_source(source_url) if source_url
+          source_url = resolve_module_source(dependency, base_url)
         when "provider", "providers"
-          response = http_get(URI.join(base_url, "#{dependency.name}/#{dependency.version}"))
-          return nil unless response.status == 200
-
-          source_url = JSON.parse(response.body).fetch("source")
+          source_url = resolve_provider_source(dependency, base_url)
         end
 
-        Source.from_url(source_url) if source_url
-      rescue JSON::ParserError, Excon::Error::Timeout
+        result = Source.from_url(source_url) if source_url
+
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "source_resolution_success",
+          details: {
+            dependency_name: dependency.name,
+            resolved_source_url: source_url,
+            has_source: !result.nil?
+          }
+        )
+
+        result
+      rescue JSON::ParserError, Excon::Error::Timeout => e
+        PrivateRegistryLogger.log_registry_error(
+          hostname: hostname,
+          error: e,
+          context: {
+            operation: "source_resolution",
+            dependency_name: dependency.name,
+            dependency_version: dependency.version
+          }
+        )
         nil
+      rescue StandardError => e
+        PrivateRegistryLogger.log_registry_error(
+          hostname: hostname,
+          error: e,
+          context: {
+            operation: "source_resolution",
+            dependency_name: dependency.name,
+            dependency_version: dependency.version
+          }
+        )
+        raise
       end
 
       # Perform service discovery and return the absolute URL for
@@ -168,7 +204,66 @@ module Dependabot
       sig { params(hostname: String).returns(T::Hash[String, String]) }
       def headers_for(hostname)
         token = tokens[hostname]
-        token ? { "Authorization" => "Bearer #{token}" } : {}
+        headers = token ? { "Authorization" => "Bearer #{token}" } : {}
+
+        # Add enhanced headers for private registries
+        if PrivateRegistryLogger.private_registry?(hostname)
+          headers.merge!(enhanced_headers_for_private_registry(hostname))
+        end
+
+        headers
+      end
+
+      # Provides enhanced headers specifically for private registry requests.
+      #
+      # This method adds additional headers that improve compatibility and debugging
+      # for private registry interactions, such as a descriptive User-Agent header.
+      # It also logs authentication context for debugging purposes.
+      #
+      # @param hostname [String] The hostname of the private registry
+      # @return [Hash<String, String>] Additional headers for private registry requests
+      sig { params(hostname: String).returns(T::Hash[String, String]) }
+      def enhanced_headers_for_private_registry(hostname)
+        # Add User-Agent for better debugging and registry compatibility
+        enhanced_headers = {
+          "User-Agent" => "Dependabot-Terraform/#{Dependabot::VERSION}"
+        }
+
+        # Log authentication context for debugging
+        has_token = !tokens[hostname].nil?
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "authentication_setup",
+          details: {
+            has_token: has_token,
+            token_length: has_token ? tokens[hostname].length : 0
+          }
+        )
+
+        enhanced_headers
+      end
+
+      # Validates that appropriate credentials are available for a given hostname.
+      #
+      # For private registries, this method checks if authentication tokens are available.
+      # For public registries, it always returns true as no authentication is required.
+      # The validation result is logged for debugging purposes.
+      #
+      # @param hostname [String] The hostname to validate credentials for
+      # @return [Boolean] true if credentials are available or not required, false otherwise
+      sig { params(hostname: String).returns(T::Boolean) }
+      def validate_credentials_for_hostname(hostname)
+        return true unless PrivateRegistryLogger.private_registry?(hostname)
+
+        has_credentials = !tokens[hostname].nil?
+
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "credential_validation",
+          details: { has_credentials: has_credentials }
+        )
+
+        has_credentials
       end
 
       sig { returns(T::Hash[String, String]) }
@@ -208,8 +303,33 @@ module Dependabot
       def http_get!(url)
         response = http_get(url)
 
-        raise Dependabot::PrivateSourceAuthenticationFailure, hostname if response.status == 401
-        raise error("Response from registry was #{response.status}") unless response.status == 200
+        if response.status == 401
+          PrivateRegistryLogger.log_registry_error(
+            hostname: hostname,
+            error: StandardError.new("Authentication failed"),
+            context: {
+              operation: "http_request",
+              url: url.to_s,
+              status: response.status,
+              has_credentials: validate_credentials_for_hostname(hostname)
+            }
+          )
+          raise Dependabot::PrivateSourceAuthenticationFailure, hostname
+        end
+
+        unless response.status == 200
+          error_msg = "Response from registry was #{response.status}"
+          PrivateRegistryLogger.log_registry_error(
+            hostname: hostname,
+            error: StandardError.new(error_msg),
+            context: {
+              operation: "http_request",
+              url: url.to_s,
+              status: response.status
+            }
+          )
+          raise error(error_msg)
+        end
 
         response
       end
@@ -228,6 +348,218 @@ module Dependabot
       sig { params(message: String).returns(Dependabot::DependabotError) }
       def error(message)
         Dependabot::DependabotError.new(message)
+      end
+
+      sig { params(dependency: Dependabot::Dependency, base_url: String).returns(T.nilable(String)) }
+      def resolve_module_source(dependency, base_url)
+        # Get the full module identifier from the dependency requirements
+        requirement = T.must(dependency.requirements.first)
+        source = requirement[:source]
+        module_identifier = source[:module_identifier] || source["module_identifier"]
+        
+        # First try the download endpoint (for modules with direct source links)
+        download_url = URI.join(base_url, "#{module_identifier}/#{dependency.version}/download")
+        response = http_get(download_url)
+
+        if response.status == 401
+          raise Dependabot::PrivateSourceAuthenticationFailure, hostname
+        end
+
+        if response.status == 204
+          source_url = response.headers.fetch("X-Terraform-Get")
+          source_url = URI.join(download_url, source_url) if
+            source_url.start_with?("/", "./", "../")
+          source_url = RegistryClient.get_proxied_source(source_url) if source_url
+          
+          # Check if this is a valid Git source URL that Source.from_url can parse
+          if source_url && Source.from_url(source_url)
+            return source_url
+          end
+        end
+
+        # For private registry modules or modules without direct Git links,
+        # try to get source information from the versions endpoint
+        resolve_module_source_from_versions(dependency, base_url)
+      end
+
+      # Attempts to resolve module source from the versions API endpoint.
+      # This is used for private registry modules that don't have direct Git links
+      # but may have source repository information in their metadata.
+      #
+      # @param dependency [Dependabot::Dependency] the dependency to resolve
+      # @param base_url [String] the registry API base URL
+      # @return [String, nil] the resolved source URL or nil if not found
+      sig { params(dependency: Dependabot::Dependency, base_url: String).returns(T.nilable(String)) }
+      def resolve_module_source_from_versions(dependency, base_url)
+        # Get the full module identifier from the dependency requirements
+        requirement = T.must(dependency.requirements.first)
+        source = requirement[:source]
+        module_identifier = source[:module_identifier] || source["module_identifier"]
+        
+        versions_url = URI.join(base_url, "#{module_identifier}/versions")
+        
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "versions_api_fallback",
+          details: {
+            dependency_name: dependency.name,
+            module_identifier: module_identifier,
+            versions_url: versions_url.to_s
+          }
+        )
+        
+        response = http_get(versions_url)
+        return nil unless response.status == 200
+
+        begin
+          body = JSON.parse(response.body)
+          modules = body["modules"]
+          return nil unless modules&.any?
+
+          module_data = modules.first
+          source_field = module_data["source"]
+          
+          PrivateRegistryLogger.log_registry_operation(
+            hostname: hostname,
+            operation: "versions_api_source_found",
+            details: {
+              dependency_name: dependency.name,
+              source_field: source_field,
+              is_registry_identifier: source_field&.include?(hostname)
+            }
+          )
+
+          # If source is a registry identifier (e.g., "app.terraform.io/org/module/provider"),
+          # try to get VCS information from TFC v2 API (for app.terraform.io)
+          if source_field&.include?(hostname)
+            PrivateRegistryLogger.log_registry_operation(
+              hostname: hostname,
+              operation: "attempting_tfc_v2_api",
+              details: {
+                dependency_name: dependency.name,
+                message: "Registry identifier found, trying TFC v2 API for VCS info"
+              }
+            )
+            
+            vcs_url = resolve_vcs_from_tfc_v2_api(dependency)
+            return vcs_url if vcs_url
+            
+            PrivateRegistryLogger.log_registry_operation(
+              hostname: hostname,
+              operation: "no_git_source_available",
+              details: {
+                dependency_name: dependency.name,
+                message: "No VCS repository found in TFC v2 API"
+              }
+            )
+            return nil
+          end
+
+          # If it's a Git URL, return it
+          if source_field && Source.from_url(source_field)
+            return source_field
+          end
+
+          nil
+        rescue JSON::ParserError => e
+          PrivateRegistryLogger.log_registry_error(
+            hostname: hostname,
+            error: e,
+            context: {
+              operation: "versions_api_parse_error",
+              dependency_name: dependency.name
+            }
+          )
+          nil
+        end
+      end
+
+      # Attempts to resolve VCS repository information from Terraform Cloud v2 API.
+      # This is specifically for app.terraform.io private modules that have VCS integration
+      # but don't expose the Git URL through the standard registry protocol.
+      #
+      # @param dependency [Dependabot::Dependency] the dependency to resolve
+      # @return [String, nil] the Git repository URL or nil if not found
+      sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
+      def resolve_vcs_from_tfc_v2_api(dependency)
+        # Only try TFC v2 API for app.terraform.io
+        return nil unless hostname == "app.terraform.io"
+
+        requirement = T.must(dependency.requirements.first)
+        source = requirement[:source]
+        module_identifier = source[:module_identifier] || source["module_identifier"]
+        
+        # Parse module identifier: org/module/provider
+        parts = module_identifier.split("/")
+        return nil unless parts.length == 3
+        
+        org, module_name, provider = parts
+        
+        # Construct TFC v2 API URL
+        tfc_v2_url = URI.join("https://app.terraform.io/", "/api/v2/organizations/#{org}/registry-modules/private/#{module_identifier}")
+        
+        PrivateRegistryLogger.log_registry_operation(
+          hostname: hostname,
+          operation: "tfc_v2_api_request",
+          details: {
+            dependency_name: dependency.name,
+            tfc_v2_url: tfc_v2_url.to_s,
+            organization: org
+          }
+        )
+        
+        # Make request with TFC v2 API headers
+        token = tokens[hostname]
+        headers = {}
+        headers["Authorization"] = "Bearer #{token}" if token
+        headers["Content-Type"] = "application/vnd.api+json"
+        
+        response = Dependabot::RegistryClient.get(
+          url: tfc_v2_url.to_s,
+          headers: headers
+        )
+        return nil unless response.status == 200
+        
+        begin
+          body = JSON.parse(response.body)
+          vcs_repo = body.dig("data", "attributes", "vcs-repo")
+          
+          if vcs_repo && vcs_repo["repository-http-url"]
+            repository_url = vcs_repo["repository-http-url"]
+            
+            PrivateRegistryLogger.log_registry_operation(
+              hostname: hostname,
+              operation: "tfc_v2_vcs_found",
+              details: {
+                dependency_name: dependency.name,
+                repository_url: repository_url,
+                service_provider: vcs_repo["service-provider"]
+              }
+            )
+            
+            return repository_url
+          end
+          
+          nil
+        rescue JSON::ParserError => e
+          PrivateRegistryLogger.log_registry_error(
+            hostname: hostname,
+            error: e,
+            context: {
+              operation: "tfc_v2_api_parse_error",
+              dependency_name: dependency.name
+            }
+          )
+          nil
+        end
+      end
+
+      sig { params(dependency: Dependabot::Dependency, base_url: String).returns(T.nilable(String)) }
+      def resolve_provider_source(dependency, base_url)
+        response = http_get(URI.join(base_url, "#{dependency.name}/#{dependency.version}"))
+        return nil unless response.status == 200
+
+        JSON.parse(response.body).fetch("source")
       end
     end
   end
